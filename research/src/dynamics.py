@@ -7,6 +7,7 @@ import ast
 import math
 
 import numpy as np
+from numba import njit
 import pandas as pd
 
 
@@ -191,9 +192,190 @@ def bolza_cost(initial_state: np.ndarray, controls: np.ndarray, cfg: CostConfig)
     terminal_penalty = cfg.terminal_penalty * _euclidean(states[cfg.num_intervals], cfg.terminal_state)
     return cfg.dt * cfg.num_intervals + terminal_penalty + cylinder_penalty + window_penalty
 
+def anneal(initial_state, start_controls, cfg, n_iter=200000, step_size=0.01, t0=200.0):
+    initial_state = np.asarray(initial_state, dtype=np.float64)
+    start_controls = np.asarray(start_controls, dtype=np.float64)
+
+    terminal_state = np.asarray(cfg.terminal_state, dtype=np.float64)
+    cylinders = np.asarray([(c.x, c.z, c.radius) for c in cfg.cylinders], dtype=np.float64)
+    windows = np.asarray([(w.x, w.z, w.radius) for w in cfg.windows], dtype=np.float64)
+
+    return anneal_nb(
+        initial_state=initial_state,
+        start_controls=start_controls,
+        dt=cfg.dt,
+        num_intervals=cfg.num_intervals,
+        terminal_state=terminal_state,
+        terminal_penalty_weight=cfg.terminal_penalty,
+        cylinders=cylinders,
+        cylinder_penalty_weight=cfg.cylinder_penalty,
+        windows=windows,
+        window_penalty_weight=cfg.window_penalty,
+        n_iter=n_iter,
+        step_size=step_size,
+        t0=t0,
+    )
 
 def clamp_controls(controls: np.ndarray) -> np.ndarray:
     """Clip controls to physically valid ranges used by solver."""
     lower = CONTROL_LIMITS[:, 0]
     upper = CONTROL_LIMITS[:, 1]
     return np.clip(np.asarray(controls, dtype=float), lower, upper)
+
+@njit(cache=True)
+def model_nb(state, control):
+    phi, theta, psi, thrust = control
+
+    out = np.empty(6, dtype=np.float64)
+    out[0] = state[3]
+    out[1] = state[4]
+    out[2] = state[5]
+    out[3] = (math.cos(psi) * math.sin(theta) * math.cos(phi) +
+              math.sin(psi) * math.sin(phi)) * thrust
+    out[4] = (math.sin(psi) * math.sin(theta) * math.cos(phi) -
+              math.cos(psi) * math.sin(phi)) * thrust
+    out[5] = thrust * math.cos(theta) * math.cos(phi) - EARTH_GRAVITY
+    return out
+
+@njit(cache=True)
+def rk4_step_nb(state, control, dt):
+    k1 = model_nb(state, control)
+    k2 = model_nb(state + 0.5 * dt * k1, control)
+    k3 = model_nb(state + 0.5 * dt * k2, control)
+    k4 = model_nb(state + dt * k3, control)
+    return state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+@njit(cache=True)
+def rollout_nb(initial_state, controls, dt):
+    n = controls.shape[0]
+    states = np.empty((n + 1, 6), dtype=np.float64)
+    states[0] = initial_state
+    for k in range(n):
+        states[k + 1] = rk4_step_nb(states[k], controls[k], dt)
+    return states
+
+@njit(cache=True)
+def clamp_controls_nb(controls):
+    lower = CONTROL_LIMITS[:, 0]
+    upper = CONTROL_LIMITS[:, 1]
+    return np.clip(controls, lower, upper)
+
+@njit(cache=True)
+def euclidean_nb(a, b):
+    acc = 0.0
+    for i in range(a.shape[0]):
+        d = a[i] - b[i]
+        acc += d * d
+    return math.sqrt(acc)
+
+@njit(cache=True)
+def bolza_cost_nb(
+    initial_state,
+    controls,
+    dt,
+    num_intervals,
+    terminal_state,
+    terminal_penalty_weight,
+    cylinders,          # shape (n_cyl, 3): x, z, radius
+    cylinder_penalty_weight,
+    windows,            # shape (n_win, 3): x, z, radius
+    window_penalty_weight,
+):
+    states = rollout_nb(initial_state, controls, dt)
+
+    cylinder_penalty = 0.0
+    for i in range(states.shape[0]):
+        x1 = states[i, 0]
+        x3 = states[i, 2]
+        for j in range(cylinders.shape[0]):
+            cx = cylinders[j, 0]
+            cz = cylinders[j, 1]
+            cr = cylinders[j, 2]
+            signed_distance = cr - math.hypot(x1 - cx, x3 - cz)
+            if signed_distance >= 0.0:
+                cylinder_penalty += cylinder_penalty_weight
+
+    window_penalty = 0.0
+    for j in range(windows.shape[0]):
+        wx = windows[j, 0]
+        wz = windows[j, 1]
+        wr = windows[j, 2]
+
+        min_distance = 1e300
+        for i in range(states.shape[0]):
+            d = math.hypot(states[i, 0] - wx, states[i, 2] - wz) - wr
+            if d < min_distance:
+                min_distance = d
+
+        if min_distance > 0.0:
+            window_penalty += window_penalty_weight * (min_distance * min_distance)
+
+    terminal_penalty = terminal_penalty_weight * euclidean_nb(states[num_intervals], terminal_state)
+
+    return dt * num_intervals + terminal_penalty + cylinder_penalty + window_penalty
+
+@njit(cache=True)
+def anneal_nb(
+    initial_state,
+    start_controls,
+    dt,
+    num_intervals,
+    terminal_state,
+    terminal_penalty_weight,
+    cylinders,
+    cylinder_penalty_weight,
+    windows,
+    window_penalty_weight,
+    n_iter=200000,
+    step_size=0.01,
+    t0=200.0,
+):
+    current_u = clamp_controls_nb(start_controls.copy())
+    current_j = bolza_cost_nb(
+        initial_state, current_u, dt, num_intervals,
+        terminal_state, terminal_penalty_weight,
+        cylinders, cylinder_penalty_weight,
+        windows, window_penalty_weight,
+    )
+
+    best_u = current_u.copy()
+    best_j = current_j
+
+    trace_len = n_iter // 100 + 1
+    trace = np.empty(trace_len, dtype=np.float64)
+    trace[0] = current_j
+    trace_idx = 1
+
+    for i in range(n_iter):
+        temp = t0 / (1.0 + 0.01 * i)
+
+        noise = np.random.normal(0.0, step_size, current_u.shape)
+        cand_u = clamp_controls_nb(current_u + noise)
+
+        cand_j = bolza_cost_nb(
+            initial_state, cand_u, dt, num_intervals,
+            terminal_state, terminal_penalty_weight,
+            cylinders, cylinder_penalty_weight,
+            windows, window_penalty_weight,
+        )
+
+        accept = False
+        if cand_j < current_j:
+            accept = True
+        else:
+            p = math.exp((current_j - cand_j) / max(temp, 1e-9))
+            if np.random.random() < p:
+                accept = True
+
+        if accept:
+            current_u = cand_u
+            current_j = cand_j
+            if cand_j < best_j:
+                best_j = cand_j
+                best_u = cand_u.copy()
+
+        if i % 100 == 0:
+            trace[trace_idx] = best_j
+            trace_idx += 1
+
+    return best_u, best_j, trace
