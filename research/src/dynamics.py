@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 import ast
 import math
 
@@ -120,6 +120,36 @@ def build_trajectory_bundle(samples: pd.DataFrame) -> Dict[int, Dict[str, np.nda
     return bundle
 
 
+def select_top_k_trajectories(
+    samples: pd.DataFrame,
+    bundle: Mapping[int, Mapping[str, np.ndarray | float]],
+    top_k: int,
+) -> Tuple[List[int], Dict[int, Dict[str, np.ndarray | float]], pd.DataFrame]:
+    """Select top-k trajectories with the smallest score."""
+    score_table = (
+        samples[["trajectory_id", "score"]]
+        .drop_duplicates()
+        .sort_values("score")
+        .reset_index(drop=True)
+    )
+    selected_ids = score_table.head(int(top_k))["trajectory_id"].astype(int).tolist()
+    selected = {tid: dict(bundle[tid]) for tid in selected_ids}
+    return selected_ids, selected, score_table
+
+
+def split_trajectory_ids(
+    trajectory_ids: Sequence[int],
+    train_ratio: float = 0.8,
+    seed: int | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Shuffle trajectory IDs and split into train/test sets."""
+    ids = np.asarray(trajectory_ids, dtype=int)
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(ids)
+    train_cut = int(float(train_ratio) * len(shuffled))
+    return shuffled[:train_cut], shuffled[train_cut:]
+
+
 def model(state: np.ndarray, control: np.ndarray) -> np.ndarray:
     """
     Quadrotor translational dynamics.
@@ -221,6 +251,183 @@ def clamp_controls(controls: np.ndarray) -> np.ndarray:
     lower = CONTROL_LIMITS[:, 0]
     upper = CONTROL_LIMITS[:, 1]
     return np.clip(np.asarray(controls, dtype=float), lower, upper)
+
+
+class QuadraticBundleController:
+    """Per-step ridge-regression controller on quadratic state features."""
+
+    def __init__(self, m_features: int = 6, ridge_lambda: float = 1e-3) -> None:
+        self.m = int(m_features)
+        self.ridge_lambda = float(ridge_lambda)
+        self.models: Dict[int, np.ndarray] = {}
+        self.control_dim = CONTROL_LIMITS.shape[0]
+
+    def _basis(self, x_batch: np.ndarray) -> np.ndarray:
+        x = np.asarray(x_batch[:, : self.m], dtype=float)
+        quad_terms = []
+        for i in range(self.m):
+            for j in range(i, self.m):
+                term = x[:, i] * x[:, j]
+                if i == j:
+                    term = 0.5 * term
+                quad_terms.append(term)
+        return np.column_stack(quad_terms + [x, np.ones(len(x), dtype=float)])
+
+    def fit(
+        self,
+        bundle_dict: Mapping[int, Mapping[str, np.ndarray | float]],
+        trajectory_ids: Sequence[int],
+        n_steps: int,
+    ) -> "QuadraticBundleController":
+        self.models = {}
+        for step in range(1, int(n_steps) + 1):
+            x_rows: List[np.ndarray] = []
+            u_rows: List[np.ndarray] = []
+            for tid in trajectory_ids:
+                row = bundle_dict[int(tid)]
+                x_arr = np.asarray(row["X"], dtype=float)
+                u_arr = np.asarray(row["U"], dtype=float)
+                if step <= len(x_arr) and step <= len(u_arr):
+                    x_rows.append(x_arr[step - 1])
+                    u_rows.append(u_arr[step - 1])
+            if not x_rows:
+                continue
+
+            xs = np.vstack(x_rows)
+            us = np.vstack(u_rows)
+            self.control_dim = us.shape[1]
+            g = self._basis(xs)
+            reg = self.ridge_lambda * np.eye(g.shape[1], dtype=float)
+            self.models[step] = np.linalg.solve(g.T @ g + reg, g.T @ us)
+        return self
+
+    def predict(self, x_state: np.ndarray, step: int) -> np.ndarray:
+        coeff = self.models.get(int(step))
+        if coeff is None:
+            return np.zeros(self.control_dim, dtype=float)
+
+        x = np.asarray(x_state[: self.m], dtype=float)
+        basis = []
+        for i in range(self.m):
+            for j in range(i, self.m):
+                basis.append(0.5 * x[i] * x[i] if i == j else x[i] * x[j])
+        basis.extend(x.tolist())
+        basis.append(1.0)
+        u = np.asarray(basis, dtype=float) @ coeff
+        return clamp_controls(u)
+
+
+def train_quadratic_controllers(
+    bundle_dict: Mapping[int, Mapping[str, np.ndarray | float]],
+    train_ids: Sequence[int],
+    n_steps: int,
+    feature_dims: Sequence[int],
+    ridge_lambda: float = 2e-3,
+) -> Dict[int, QuadraticBundleController]:
+    """Train multiple quadratic controllers keyed by number of state features."""
+    controllers: Dict[int, QuadraticBundleController] = {}
+    for m in feature_dims:
+        ctrl = QuadraticBundleController(m_features=int(m), ridge_lambda=ridge_lambda)
+        ctrl.fit(bundle_dict, train_ids, n_steps)
+        controllers[int(m)] = ctrl
+    return controllers
+
+
+def evaluate_pointwise_rmse(
+    bundle_dict: Mapping[int, Mapping[str, np.ndarray | float]],
+    test_ids: Sequence[int],
+    controller: QuadraticBundleController,
+    n_steps: int,
+) -> Tuple[np.ndarray, float]:
+    """Evaluate control RMSE on held-out trajectory steps."""
+    errors = []
+    for tid in test_ids:
+        row = bundle_dict[int(tid)]
+        x_arr = np.asarray(row["X"], dtype=float)
+        u_arr = np.asarray(row["U"], dtype=float)
+        upper = min(len(x_arr), len(u_arr), int(n_steps))
+        for step in range(1, upper + 1):
+            u_hat = controller.predict(x_arr[step - 1], step)
+            errors.append((u_hat - u_arr[step - 1]) ** 2)
+
+    if not errors:
+        return np.zeros(controller.control_dim, dtype=float), 0.0
+
+    err = np.asarray(errors, dtype=float)
+    rmse_per_control = np.sqrt(err.mean(axis=0))
+    global_rmse = float(np.sqrt(err.mean()))
+    return rmse_per_control, global_rmse
+
+
+def synthesize_with_controller(
+    initial_state: np.ndarray,
+    controller: QuadraticBundleController,
+    cfg: CostConfig,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Roll out closed-loop dynamics and compute Bolza score."""
+    x = np.asarray(initial_state, dtype=float)
+    controls = []
+    for step in range(1, cfg.num_intervals + 1):
+        u = controller.predict(x, step)
+        controls.append(u)
+        x = rollout(x, np.asarray([u]), cfg.dt)[-1]
+
+    controls_arr = np.asarray(controls, dtype=float)
+    states = rollout(initial_state, controls_arr, cfg.dt)
+    score = bolza_cost(initial_state, controls_arr, cfg)
+    return states, controls_arr, score
+
+
+def evaluate_closed_loop(
+    bundle_dict: Mapping[int, Mapping[str, np.ndarray | float]],
+    trajectory_ids: Sequence[int],
+    controller: QuadraticBundleController,
+    cfg: CostConfig,
+    max_cases: int | None = None,
+) -> Tuple[List[Dict[str, np.ndarray | float | int]], pd.DataFrame]:
+    """Run closed-loop synthesis from bundle initial states."""
+    results: List[Dict[str, np.ndarray | float | int]] = []
+    ids = list(trajectory_ids)
+    if max_cases is not None:
+        ids = ids[: int(max_cases)]
+
+    for tid in ids:
+        row = bundle_dict[int(tid)]
+        x0 = np.asarray(row["X"], dtype=float)[0]
+        states, controls, score = synthesize_with_controller(x0, controller, cfg)
+        results.append(
+            {
+                "trajectory_id": int(tid),
+                "pred_score": float(score),
+                "true_score": float(row["score"]),
+                "states": states,
+                "controls": controls,
+            }
+        )
+
+    summary = pd.DataFrame(
+        [{k: v for k, v in record.items() if k not in ("states", "controls")} for record in results]
+    )
+    return results, summary
+
+
+def terminal_errors(
+    results: Sequence[Mapping[str, np.ndarray | float | int]],
+    cfg: CostConfig,
+    max_cases: int | None = None,
+) -> np.ndarray:
+    """Compute terminal position errors for synthesized trajectories."""
+    rows = list(results)
+    if max_cases is not None:
+        rows = rows[: int(max_cases)]
+
+    errors = []
+    terminal = np.asarray(cfg.terminal_state[:3], dtype=float)
+    for row in rows:
+        states = np.asarray(row["states"], dtype=float)
+        err = np.linalg.norm(states[-1][:3] - terminal)
+        errors.append(float(err))
+    return np.asarray(errors, dtype=float)
 
 @njit(cache=True)
 def model_nb(state, control):
