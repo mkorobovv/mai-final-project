@@ -262,15 +262,43 @@ class QuadraticBundleController:
         self.models: Dict[int, np.ndarray] = {}
         self.control_dim = CONTROL_LIMITS.shape[0]
 
+    def _feature_indices(self) -> List[int]:
+        if self.m == 2:
+            return [0, 3]
+        if self.m == 3:
+            return [0, 2, 5]
+        if self.m == 4:
+            return [0, 2, 3, 5]
+        if self.m == 5:
+            return [0, 2, 3, 4, 5]
+        return list(range(self.m))
+
+    def _select_features(self, x: np.ndarray) -> np.ndarray:
+        """
+        Select the agreed coordinates from either:
+        - batch array of shape (N, 6)
+        - single state vector of shape (6,)
+        """
+        idx = self._feature_indices()
+        arr = np.asarray(x, dtype=float)
+        if arr.ndim == 1:
+            return arr[idx]
+        if arr.ndim == 2:
+            return arr[:, idx]
+        raise ValueError(f"Unsupported input shape for feature selection: {arr.shape}")
+
     def _basis(self, x_batch: np.ndarray) -> np.ndarray:
-        x = np.asarray(x_batch[:, : self.m], dtype=float)
+        x = self._select_features(x_batch)  # shape (N, m_eff)
+        m_eff = x.shape[1]
+
         quad_terms = []
-        for i in range(self.m):
-            for j in range(i, self.m):
+        for i in range(m_eff):
+            for j in range(i, m_eff):
                 term = x[:, i] * x[:, j]
                 if i == j:
                     term = 0.5 * term
                 quad_terms.append(term)
+
         return np.column_stack(quad_terms + [x, np.ones(len(x), dtype=float)])
 
     def fit(
@@ -280,25 +308,33 @@ class QuadraticBundleController:
         n_steps: int,
     ) -> "QuadraticBundleController":
         self.models = {}
+
         for step in range(1, int(n_steps) + 1):
             x_rows: List[np.ndarray] = []
             u_rows: List[np.ndarray] = []
+
             for tid in trajectory_ids:
                 row = bundle_dict[int(tid)]
                 x_arr = np.asarray(row["X"], dtype=float)
                 u_arr = np.asarray(row["U"], dtype=float)
+
                 if step <= len(x_arr) and step <= len(u_arr):
                     x_rows.append(x_arr[step - 1])
                     u_rows.append(u_arr[step - 1])
+
             if not x_rows:
                 continue
 
             xs = np.vstack(x_rows)
             us = np.vstack(u_rows)
             self.control_dim = us.shape[1]
+
             g = self._basis(xs)
             reg = self.ridge_lambda * np.eye(g.shape[1], dtype=float)
+
+            # Ridge: (G^T G + λI)^(-1) G^T U
             self.models[step] = np.linalg.solve(g.T @ g + reg, g.T @ us)
+
         return self
 
     def predict(self, x_state: np.ndarray, step: int) -> np.ndarray:
@@ -306,13 +342,17 @@ class QuadraticBundleController:
         if coeff is None:
             return np.zeros(self.control_dim, dtype=float)
 
-        x = np.asarray(x_state[: self.m], dtype=float)
+        x = self._select_features(x_state)  # shape (m_eff,)
+        m_eff = x.shape[0]
+
         basis = []
-        for i in range(self.m):
-            for j in range(i, self.m):
+        for i in range(m_eff):
+            for j in range(i, m_eff):
                 basis.append(0.5 * x[i] * x[i] if i == j else x[i] * x[j])
+
         basis.extend(x.tolist())
         basis.append(1.0)
+
         u = np.asarray(basis, dtype=float) @ coeff
         return clamp_controls(u)
 
