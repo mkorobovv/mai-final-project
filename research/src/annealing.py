@@ -29,8 +29,10 @@ def anneal_nb(
     n_iter=200000,
     step_size=0.01,
     t0=200.0,
+    seed=0,
 ):
     """Имитация отжига для одного начального состояния."""
+    np.random.seed(seed)
     current_u = clamp_controls_nb(start_controls.copy())
     current_j = bolza_cost_nb(
         initial_state, current_u, dt, num_intervals,
@@ -85,8 +87,10 @@ def anneal_bundle_nb(
     n_iter=200000,
     step_size=0.01,
     t0=200.0,
+    seed=0,
 ):
     """Имитация отжига, минимизирующая среднее J по пучку начальных состояний."""
+    np.random.seed(seed)
     current_u = clamp_controls_nb(start_controls.copy())
     current_j = bolza_cost_bundle_nb(
         initial_states, current_u, dt, num_intervals,
@@ -146,6 +150,7 @@ def anneal(
     n_iter: int = 200000,
     step_size: float = 0.01,
     t0: float = 200.0,
+    seed: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """Оптимизация управления для одного начального состояния."""
     terminal_state, cylinders, windows = _cfg_to_arrays(cfg)
@@ -163,6 +168,7 @@ def anneal(
         n_iter=n_iter,
         step_size=step_size,
         t0=t0,
+        seed=seed,
     )
 
 
@@ -173,6 +179,7 @@ def anneal_bundle(
     n_iter: int = 200000,
     step_size: float = 0.01,
     t0: float = 200.0,
+    seed: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
     """Оптимизация управления по пучку начальных состояний (минимизация среднего J)."""
     terminal_state, cylinders, windows = _cfg_to_arrays(cfg)
@@ -190,4 +197,5 @@ def anneal_bundle(
         n_iter=n_iter,
         step_size=step_size,
         t0=t0,
+        seed=seed,
     )
