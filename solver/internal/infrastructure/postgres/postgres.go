@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mkorobovv/mai-final-project/solver/migrations"
+	"github.com/pressly/goose/v3"
 )
 
 type Config struct {

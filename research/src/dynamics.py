@@ -626,3 +626,127 @@ def anneal_nb(
             trace_idx += 1
 
     return best_u, best_j, trace
+@njit(cache=True)
+def bolza_cost_bundle_nb(
+    initial_states,        # shape (S, 6) — все начальные состояния из Ω
+    controls,              # shape (N, 4) — одно общее управление
+    dt,
+    num_intervals,
+    terminal_state,
+    terminal_penalty_weight,
+    cylinders,
+    cylinder_penalty_weight,
+    windows,
+    window_penalty_weight,
+):
+    """Среднее значение функционала по пучку начальных состояний."""
+    total = 0.0
+    S = initial_states.shape[0]
+    for k in range(S):
+        total += bolza_cost_nb(
+            initial_states[k],
+            controls,
+            dt,
+            num_intervals,
+            terminal_state,
+            terminal_penalty_weight,
+            cylinders,
+            cylinder_penalty_weight,
+            windows,
+            window_penalty_weight,
+        )
+    return total / S
+
+
+@njit(cache=True)
+def anneal_bundle_nb(
+    initial_states,        # shape (S, 6)
+    start_controls,        # shape (N, 4) — стартовое U (например, U* из раздела 3)
+    dt,
+    num_intervals,
+    terminal_state,
+    terminal_penalty_weight,
+    cylinders,
+    cylinder_penalty_weight,
+    windows,
+    window_penalty_weight,
+    n_iter=200000,
+    step_size=0.01,
+    t0=200.0,
+):
+    """
+    Имитация отжига, минимизирующая среднее J по пучку.
+    Структура идентична anneal_nb — заменена только целевая функция.
+    """
+    current_u = clamp_controls_nb(start_controls.copy())
+    current_j = bolza_cost_bundle_nb(
+        initial_states, current_u, dt, num_intervals,
+        terminal_state, terminal_penalty_weight,
+        cylinders, cylinder_penalty_weight,
+        windows, window_penalty_weight,
+    )
+
+    best_u = current_u.copy()
+    best_j = current_j
+
+    trace_len = n_iter // 100 + 1
+    trace = np.empty(trace_len, dtype=np.float64)
+    trace[0] = current_j
+    trace_idx = 1
+
+    for i in range(n_iter):
+        temp = t0 / (1.0 + 0.01 * i)
+
+        noise = np.random.normal(0.0, step_size, current_u.shape)
+        cand_u = clamp_controls_nb(current_u + noise)
+
+        cand_j = bolza_cost_bundle_nb(
+            initial_states, cand_u, dt, num_intervals,
+            terminal_state, terminal_penalty_weight,
+            cylinders, cylinder_penalty_weight,
+            windows, window_penalty_weight,
+        )
+
+        if cand_j < current_j:
+            current_u = cand_u
+            current_j = cand_j
+        else:
+            p = math.exp((current_j - cand_j) / max(temp, 1e-9))
+            if np.random.random() < p:
+                current_u = cand_u
+                current_j = cand_j
+
+        if cand_j < best_j:
+            best_j = cand_j
+            best_u = cand_u.copy()
+
+        if i % 100 == 0:
+            trace[trace_idx] = best_j
+            trace_idx += 1
+
+    return best_u, best_j, trace
+
+def anneal_bundle(initial_states, start_controls, cfg,
+                  n_iter=200000, step_size=0.01, t0=200.0):
+    """
+    initial_states: array (S, 6) — начальные состояния из ε-окрестности
+    start_controls: array (N, 4) — U* из раздела 3 как начальное приближение
+    """
+    initial_states = np.asarray(initial_states, dtype=np.float64)
+    start_controls = np.asarray(start_controls, dtype=np.float64)
+
+    return anneal_bundle_nb(
+        initial_states=initial_states,
+        start_controls=start_controls,
+        dt=cfg.dt,
+        num_intervals=cfg.num_intervals,
+        terminal_state=np.asarray(cfg.terminal_state, dtype=np.float64),
+        terminal_penalty_weight=cfg.terminal_penalty,
+        cylinders=np.asarray([(c.x, c.z, c.radius) for c in cfg.cylinders], dtype=np.float64),
+        cylinder_penalty_weight=cfg.cylinder_penalty,
+        windows=np.asarray([(w.x, w.z, w.radius) for w in cfg.windows], dtype=np.float64),
+        window_penalty_weight=cfg.window_penalty,
+        n_iter=n_iter,
+        step_size=step_size,
+        t0=t0,
+    )
