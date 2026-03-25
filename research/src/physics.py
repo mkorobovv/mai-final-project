@@ -198,3 +198,32 @@ def bolza_cost_bundle_nb(
             windows, window_penalty_weight,
         )
     return total / initial_states.shape[0]
+
+
+@njit(cache=True)
+def bolza_cost_bundle_max_nb(
+    initial_states,         # shape (S, 6) — пучок начальных состояний
+    controls,               # shape (N, 4) — общее управление
+    dt,
+    num_intervals,
+    terminal_state,
+    terminal_penalty_weight,
+    cylinders,
+    cylinder_penalty_weight,
+    windows,
+    window_penalty_weight,
+):
+    """Максимальное значение функционала по всем начальным состояниям пучка."""
+    worst = -1e300
+    for k in range(initial_states.shape[0]):
+        j = bolza_cost_nb(
+            initial_states[k], controls, dt, num_intervals,
+            terminal_state, terminal_penalty_weight,
+            cylinders, cylinder_penalty_weight,
+            windows, window_penalty_weight,
+        )
+
+        if j > worst:
+            worst = j
+
+    return worst
