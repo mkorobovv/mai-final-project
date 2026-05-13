@@ -30,26 +30,21 @@ func New(config Config, costService costService) *Annealing {
 	return &Annealing{config: config, costService: costService}
 }
 
-// Optimize runs the simulated annealing search.
 func (a *Annealing) Optimize() control.Output {
-	bestControls := a.config.InitialControls
+	bestControls := cloneControls(a.config.InitialControls)
 	bestScore := a.costService.Cost(a.config.InitialState, bestControls)
 
-	currentControls := bestControls
+	currentControls := cloneControls(bestControls)
 	currentScore := bestScore
 
-	temperature := func(i int) float64 {
-		return a.config.InitialTemperature / (1 + 0.01*float64(i))
-	}
-
 	for i := 0; i < a.config.NumIterations; i++ {
-		t := temperature(i)
+		temperature := a.temperature(i)
 
-		candidateControls := a.GetNeighbor(currentControls, a.config.StepSize)
+		candidateControls := a.neighborControls(currentControls)
 		candidateScore := a.costService.Cost(a.config.InitialState, candidateControls)
 
 		accept := candidateScore < currentScore ||
-			a.config.Rnd.Float64() < math.Exp((currentScore-candidateScore)/t)
+			a.config.Rnd.Float64() < math.Exp((currentScore-candidateScore)/temperature)
 
 		if accept {
 			currentControls = candidateControls
@@ -68,13 +63,21 @@ func (a *Annealing) Optimize() control.Output {
 	}
 }
 
-// GetNeighbor generates a neighboring control sequence.
-func (a *Annealing) GetNeighbor(controls []control.Control, stepSize float64) []control.Control {
+func (a *Annealing) temperature(iteration int) float64 {
+	temperature := a.config.InitialTemperature / (1 + 0.01*float64(iteration))
+	if temperature < 1e-9 {
+		return 1e-9
+	}
+
+	return temperature
+}
+
+func (a *Annealing) neighborControls(controls []control.Control) []control.Control {
 	neighbor := make([]control.Control, len(controls))
 
 	for i := range controls {
 		for j := 0; j < 4; j++ {
-			neighbor[i][j] = controls[i][j] + a.config.Rnd.NormFloat64()*stepSize
+			neighbor[i][j] = controls[i][j] + a.config.Rnd.NormFloat64()*a.config.StepSize
 		}
 
 		neighbor[i][0] = mathlib.Clamp(neighbor[i][0], -math.Pi/12, math.Pi/12)
@@ -84,4 +87,11 @@ func (a *Annealing) GetNeighbor(controls []control.Control, stepSize float64) []
 	}
 
 	return neighbor
+}
+
+func cloneControls(controls []control.Control) []control.Control {
+	cloned := make([]control.Control, len(controls))
+	copy(cloned, controls)
+
+	return cloned
 }

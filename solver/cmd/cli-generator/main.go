@@ -11,29 +11,31 @@ import (
 	"github.com/mkorobovv/mai-final-project/solver/internal/repositories/trajectoryrepository"
 )
 
+func exitWithError(logger *slog.Logger, message string, err error) {
+	logger.Error(message, slog.String("error", err.Error()))
+	os.Exit(1)
+}
+
 func main() {
 	ctx := context.Background()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	cfg := app.DefaultConfig()
 	if err := cfg.Validate(); err != nil {
-		logger.Error("invalid generator config", slog.String("error", err.Error()))
-		os.Exit(1)
+		exitWithError(logger, "invalid generator config", err)
 	}
 
 	pgpool, err := postgres.New(ctx, cfg.Database)
 	if err != nil {
-		logger.Error("failed to initialize postgres", slog.String("error", err.Error()))
-		os.Exit(1)
+		exitWithError(logger, "failed to initialize postgres", err)
 	}
 	defer pgpool.Close()
 
 	scoreRepository := scorerepository.New(pgpool)
 	trajectoryRepository := trajectoryrepository.New(pgpool)
 
-	a := app.New(logger, cfg, scoreRepository, trajectoryRepository)
-	if err := a.Start(ctx); err != nil {
-		logger.Error("generator stopped with error", slog.String("error", err.Error()))
-		os.Exit(1)
+	application := app.New(logger, cfg, scoreRepository, trajectoryRepository)
+	if err := application.Start(ctx); err != nil {
+		exitWithError(logger, "generator stopped with error", err)
 	}
 }

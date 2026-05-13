@@ -6,19 +6,10 @@ import numpy as np
 import pandas as pd
 
 from config import CONTROL_LIMITS, CostConfig
-from physics import bolza_cost, clamp_controls, rollout
+from physics import bolza_cost, clamp_controls, rk4_step, rollout
 
 
 class QuadraticBundleController:
-    """
-    Пошаговый регулятор на основе гребневой регрессии на квадратичных признаках состояния.
-
-    Для каждого временного шага обучается отдельная линейная модель:
-        u = W^T * phi(x),
-    где phi(x) — вектор квадратичных, линейных и константного признаков.
-    """
-
-    # Карта: количество признаков → индексы координат из 6-мерного состояния
     _FEATURE_INDEX_MAP: Dict[int, List[int]] = {
         1: [0],
         2: [0, 3],
@@ -47,7 +38,6 @@ class QuadraticBundleController:
         raise ValueError(f"Неподдерживаемая форма входных данных: {arr.shape}")
 
     def _basis_batch(self, x_batch: np.ndarray) -> np.ndarray:
-        """Строит матрицу признаков для батча состояний (N, m_eff) → (N, d_basis)."""
         x = self._select_features(x_batch)
         m_eff = x.shape[1]
 
@@ -62,7 +52,6 @@ class QuadraticBundleController:
         return np.column_stack(quad_terms + [x, np.ones(len(x), dtype=float)])
 
     def _basis_single(self, x: np.ndarray) -> np.ndarray:
-        """Строит вектор признаков для одного состояния (m_eff,) → (d_basis,)."""
         x = self._select_features(x)
         m_eff = x.shape[0]
 
@@ -74,52 +63,61 @@ class QuadraticBundleController:
         basis.append(1.0)
         return np.asarray(basis, dtype=float)
 
+    def _collect_step_samples(
+        self,
+        bundle_dict: Mapping,
+        trajectory_ids: Sequence[int],
+        step: int,
+    ) -> Tuple[np.ndarray | None, np.ndarray | None]:
+        states: List[np.ndarray] = []
+        controls: List[np.ndarray] = []
+
+        for trajectory_id in trajectory_ids:
+            row = bundle_dict[int(trajectory_id)]
+            state_sequence = np.asarray(row["X"], dtype=float)
+            control_sequence = np.asarray(row["U"], dtype=float)
+
+            if step > len(state_sequence) or step > len(control_sequence):
+                continue
+
+            states.append(state_sequence[step - 1])
+            controls.append(control_sequence[step - 1])
+
+        if not states:
+            return None, None
+
+        return np.vstack(states), np.vstack(controls)
+
     def fit(
         self,
         bundle_dict: Mapping,
         trajectory_ids: Sequence[int],
         n_steps: int,
     ) -> QuadraticBundleController:
-        """Обучает регрессионные модели для каждого шага по обучающей выборке траекторий."""
         self.models = {}
 
         for step in range(1, int(n_steps) + 1):
-            x_rows, u_rows = [], []
-
-            for tid in trajectory_ids:
-                row = bundle_dict[int(tid)]
-                x_arr = np.asarray(row["X"], dtype=float)
-                u_arr = np.asarray(row["U"], dtype=float)
-                if step <= len(x_arr) and step <= len(u_arr):
-                    x_rows.append(x_arr[step - 1])
-                    u_rows.append(u_arr[step - 1])
-
-            if not x_rows:
+            states, controls = self._collect_step_samples(bundle_dict, trajectory_ids, step)
+            if states is None or controls is None:
                 continue
 
-            xs = np.vstack(x_rows)
-            us = np.vstack(u_rows)
-            self.control_dim = us.shape[1]
+            self.control_dim = controls.shape[1]
 
-            G = self._basis_batch(xs)
-            reg = self.ridge_lambda * np.eye(G.shape[1], dtype=float)
-            # Гребневая регрессия: W = (G^T G + λI)^{-1} G^T U
-            self.models[step] = np.linalg.solve(G.T @ G + reg, G.T @ us)
+            design_matrix = self._basis_batch(states)
+            ridge_matrix = self.ridge_lambda * np.eye(design_matrix.shape[1], dtype=float)
+            self.models[step] = np.linalg.solve(
+                design_matrix.T @ design_matrix + ridge_matrix,
+                design_matrix.T @ controls,
+            )
 
         return self
 
     def predict(self, x_state: np.ndarray, step: int) -> np.ndarray:
-        """Вычисляет управление по текущему состоянию и номеру шага."""
         coeff = self.models.get(int(step))
         if coeff is None:
             return np.zeros(self.control_dim, dtype=float)
-        u = self._basis_single(x_state) @ coeff
-        return clamp_controls(u)
+        return clamp_controls(self._basis_single(x_state) @ coeff)
 
-
-# ---------------------------------------------------------------------------
-# Фабрика регуляторов
-# ---------------------------------------------------------------------------
 
 def train_quadratic_controllers(
     bundle_dict: Mapping,
@@ -128,7 +126,6 @@ def train_quadratic_controllers(
     feature_dims: Sequence[int],
     ridge_lambda: float = 2e-3,
 ) -> Dict[int, QuadraticBundleController]:
-    """Обучает набор квадратичных регуляторов для разных размерностей признакового пространства."""
     controllers: Dict[int, QuadraticBundleController] = {}
     for m in feature_dims:
         ctrl = QuadraticBundleController(m_features=int(m), ridge_lambda=ridge_lambda)
@@ -136,23 +133,18 @@ def train_quadratic_controllers(
         controllers[int(m)] = ctrl
     return controllers
 
-
-# ---------------------------------------------------------------------------
-# Оценка качества
-# ---------------------------------------------------------------------------
-
 def synthesize_with_controller(
     initial_state: np.ndarray,
     controller: QuadraticBundleController,
     cfg: CostConfig,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Разворачивает замкнутую траекторию с синтезированным управлением."""
-    x = np.asarray(initial_state, dtype=float)
+    state = np.asarray(initial_state, dtype=float)
     controls = []
+
     for step in range(1, cfg.num_intervals + 1):
-        u = controller.predict(x, step)
-        controls.append(u)
-        x = rollout(x, np.asarray([u]), cfg.dt)[-1]
+        control = controller.predict(state, step)
+        controls.append(control)
+        state = rk4_step(state, control, cfg.dt)
 
     controls_arr = np.asarray(controls, dtype=float)
     states = rollout(initial_state, controls_arr, cfg.dt)
@@ -167,7 +159,6 @@ def evaluate_closed_loop(
     cfg: CostConfig,
     max_cases: int | None = None,
 ) -> Tuple[List[Dict], pd.DataFrame]:
-    """Запускает синтез для начальных состояний из тестовой выборки."""
     ids = list(trajectory_ids)
     if max_cases is not None:
         ids = ids[:int(max_cases)]
@@ -177,13 +168,15 @@ def evaluate_closed_loop(
         row = bundle_dict[int(tid)]
         x0 = np.asarray(row["X"], dtype=float)[0]
         states, controls, score = synthesize_with_controller(x0, controller, cfg)
-        results.append({
-            "trajectory_id": int(tid),
-            "pred_score": float(score),
-            "true_score": float(row["score"]),
-            "states": states,
-            "controls": controls,
-        })
+        results.append(
+            {
+                "trajectory_id": int(tid),
+                "pred_score": float(score),
+                "true_score": float(row["score"]),
+                "states": states,
+                "controls": controls,
+            }
+        )
 
     summary = pd.DataFrame([
         {k: v for k, v in r.items() if k not in ("states", "controls")}
@@ -198,7 +191,6 @@ def evaluate_pointwise_rmse(
     controller: QuadraticBundleController,
     n_steps: int,
 ) -> Tuple[np.ndarray, float]:
-    """Вычисляет RMSE управления по шагам на тестовой выборке."""
     errors = []
     for tid in test_ids:
         row = bundle_dict[int(tid)]
@@ -221,11 +213,15 @@ def terminal_errors(
     cfg: CostConfig,
     max_cases: int | None = None,
 ) -> np.ndarray:
-    """Вычисляет ошибки по положению в конечный момент времени."""
     rows = list(results)
     if max_cases is not None:
         rows = rows[:int(max_cases)]
 
     terminal = np.asarray(cfg.terminal_state[:3], dtype=float)
-    errors = [float(np.linalg.norm(np.asarray(r["states"], dtype=float)[-1][:3] - terminal)) for r in rows]
+    errors = []
+
+    for row in rows:
+        terminal_state = np.asarray(row["states"], dtype=float)[-1][:3]
+        errors.append(float(np.linalg.norm(terminal_state - terminal)))
+
     return np.asarray(errors, dtype=float)

@@ -26,11 +26,13 @@ func (c Config) ConnString() string {
 		c.User, c.Password, c.Host, c.Port, c.Database)
 }
 
-func New(ctx context.Context, config Config) (*pgxpool.Pool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+const connectTimeout = 10 * time.Second
+
+func New(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
+	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 
-	connString := config.ConnString()
+	connString := cfg.ConnString()
 
 	err := runMigrations(connString)
 	if err != nil {

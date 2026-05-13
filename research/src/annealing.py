@@ -9,10 +9,24 @@ from numba import njit
 from config import CostConfig
 from physics import bolza_cost_nb, bolza_cost_bundle_nb, bolza_cost_bundle_max_nb, clamp_controls_nb
 
+@njit(cache=True)
+def _inverse_cooling(iteration, initial_temperature):
+    temperature = initial_temperature / (1.0 + 0.01 * iteration)
+    return max(temperature, 1e-9)
 
-# ---------------------------------------------------------------------------
-# Numba JIT (внутренняя реализация алгоритма отжига)
-# ---------------------------------------------------------------------------
+
+@njit(cache=True)
+def _geometric_cooling(iteration, initial_temperature):
+    temperature = initial_temperature * (0.99 ** (iteration / 1000.0))
+    return max(temperature, 1e-9)
+
+
+@njit(cache=True)
+def _should_accept(current_score, candidate_score, temperature):
+    if candidate_score < current_score:
+        return True
+    return np.random.random() < math.exp((current_score - candidate_score) / temperature)
+
 
 @njit(cache=True)
 def anneal_nb(
@@ -31,7 +45,6 @@ def anneal_nb(
     t0=200.0,
     seed=0,
 ):
-    """Имитация отжига для одного начального состояния."""
     np.random.seed(seed)
     current_u = clamp_controls_nb(start_controls.copy())
     current_j = bolza_cost_nb(
@@ -49,7 +62,7 @@ def anneal_nb(
     trace_idx = 1
 
     for i in range(n_iter):
-        temp = t0 / (1.0 + 0.01 * i)
+        temp = _inverse_cooling(i, t0)
         cand_u = clamp_controls_nb(current_u + np.random.normal(0.0, step_size, current_u.shape))
         cand_j = bolza_cost_nb(
             initial_state, cand_u, dt, num_intervals,
@@ -58,7 +71,7 @@ def anneal_nb(
             windows, window_penalty_weight,
         )
 
-        if cand_j < current_j or np.random.random() < math.exp((current_j - cand_j) / max(temp, 1e-9)):
+        if _should_accept(current_j, cand_j, temp):
             current_u = cand_u
             current_j = cand_j
             if cand_j < best_j:
@@ -74,8 +87,8 @@ def anneal_nb(
 
 @njit(cache=True)
 def anneal_bundle_nb(
-    initial_states,         # shape (S, 6) — пучок начальных состояний
-    start_controls,         # shape (N, 4) — начальное приближение U*
+    initial_states,
+    start_controls,
     dt,
     num_intervals,
     terminal_state,
@@ -89,7 +102,6 @@ def anneal_bundle_nb(
     t0=200.0,
     seed=0,
 ):
-    """Имитация отжига, минимизирующая среднее J по пучку начальных состояний."""
     np.random.seed(seed)
     current_u = clamp_controls_nb(start_controls.copy())
     current_j = bolza_cost_bundle_nb(
@@ -107,7 +119,7 @@ def anneal_bundle_nb(
     trace_idx = 1
 
     for i in range(n_iter):
-        temp = t0 / (1.0 + 0.01 * i)
+        temp = _inverse_cooling(i, t0)
         cand_u = clamp_controls_nb(current_u + np.random.normal(0.0, step_size, current_u.shape))
         cand_j = bolza_cost_bundle_nb(
             initial_states, cand_u, dt, num_intervals,
@@ -116,7 +128,7 @@ def anneal_bundle_nb(
             windows, window_penalty_weight,
         )
 
-        if cand_j < current_j or np.random.random() < math.exp((current_j - cand_j) / max(temp, 1e-9)):
+        if _should_accept(current_j, cand_j, temp):
             current_u = cand_u
             current_j = cand_j
 
@@ -133,8 +145,8 @@ def anneal_bundle_nb(
 
 @njit(cache=True)
 def anneal_bundle_max_nb(
-    initial_states,         # shape (S, 6) — пучок начальных состояний
-    start_controls,         # shape (N, 4) — начальное приближение U*
+    initial_states,
+    start_controls,
     dt,
     num_intervals,
     terminal_state,
@@ -148,7 +160,6 @@ def anneal_bundle_max_nb(
     t0=200.0,
     seed=0,
 ):
-    """Имитация отжига, минимизирующая максимальное J по пучку начальных состояний."""
     np.random.seed(seed)
     current_u = clamp_controls_nb(start_controls.copy())
     current_j = bolza_cost_bundle_max_nb(
@@ -166,7 +177,7 @@ def anneal_bundle_max_nb(
     trace_idx = 1
 
     for i in range(n_iter):
-        t0=t0 * (0.99 ** (i / 1000))
+        temp = _geometric_cooling(i, t0)
         cand_u = clamp_controls_nb(current_u + np.random.normal(0.0, step_size, current_u.shape))
         cand_j = bolza_cost_bundle_max_nb(
             initial_states, cand_u, dt, num_intervals,
@@ -175,7 +186,7 @@ def anneal_bundle_max_nb(
             windows, window_penalty_weight,
         )
 
-        if cand_j < current_j or np.random.random() < math.exp((current_j - cand_j) / max(temp, 1e-9)):
+        if _should_accept(current_j, cand_j, temp):
             current_u = cand_u
             current_j = cand_j
 
@@ -188,11 +199,6 @@ def anneal_bundle_max_nb(
             trace_idx += 1
 
     return best_u, best_j, trace
-
-
-# ---------------------------------------------------------------------------
-# Python-обёртки (принимают CostConfig, конвертируют в массивы для Numba)
-# ---------------------------------------------------------------------------
 
 def _cfg_to_arrays(cfg: CostConfig):
     return (
@@ -211,7 +217,6 @@ def anneal(
     t0: float = 200.0,
     seed: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
-    """Оптимизация управления для одного начального состояния."""
     terminal_state, cylinders, windows = _cfg_to_arrays(cfg)
     return anneal_nb(
         initial_state=np.asarray(initial_state, dtype=np.float64),
@@ -240,7 +245,6 @@ def anneal_bundle(
     t0: float = 200.0,
     seed: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
-    """Оптимизация управления по пучку начальных состояний (минимизация среднего J)."""
     terminal_state, cylinders, windows = _cfg_to_arrays(cfg)
     return anneal_bundle_nb(
         initial_states=np.asarray(initial_states, dtype=np.float64),
@@ -269,7 +273,6 @@ def anneal_bundle_max(
     t0: float = 200.0,
     seed: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray]:
-    """Оптимизация управления по пучку начальных состояний (минимизация максимального J)."""
     terminal_state, cylinders, windows = _cfg_to_arrays(cfg)
     return anneal_bundle_max_nb(
         initial_states=np.asarray(initial_states, dtype=np.float64),

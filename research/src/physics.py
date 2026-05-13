@@ -8,16 +8,8 @@ from numba import njit
 from config import CONTROL_LIMITS, EARTH_GRAVITY, CostConfig
 
 
-# ---------------------------------------------------------------------------
-# Pure Python (используется для интерактивной отладки и в болза-функционале)
-# ---------------------------------------------------------------------------
-
 def model(state: np.ndarray, control: np.ndarray) -> np.ndarray:
-    """
-    Трансляционная динамика квадрокоптера.
-    state:   [x1, x2, x3, v1, v2, v3]
-    control: [phi, theta, psi, thrust]
-    """
+    """Модель динамики квадрокоптера."""
     phi, theta, psi, thrust = control
     return np.array(
         [
@@ -42,9 +34,7 @@ def rk4_step(state: np.ndarray, control: np.ndarray, dt: float) -> np.ndarray:
 
 
 def rollout(initial_state: np.ndarray, controls: np.ndarray, dt: float) -> np.ndarray:
-    """Интегрирует траекторию по всей последовательности управлений.
-    Возвращает массив формы (len(controls) + 1, 6).
-    """
+    """Интегрирует траекторию по всей последовательности управлений."""
     states = np.zeros((len(controls) + 1, len(initial_state)), dtype=float)
     states[0] = np.asarray(initial_state, dtype=float)
     for k, u in enumerate(controls):
@@ -58,34 +48,40 @@ def clamp_controls(controls: np.ndarray) -> np.ndarray:
 
 
 def bolza_cost(initial_state: np.ndarray, controls: np.ndarray, cfg: CostConfig) -> float:
-    """
-    Функционал Больцы:
-    dt * N + штраф_терминальный + штрафы_цилиндры + штраф_окно.
-    """
     states = rollout(initial_state, controls, cfg.dt)
-
-    cylinder_penalty = 0.0
-    for st in states:
-        x1, x3 = st[0], st[2]
-        for cyl in cfg.cylinders:
-            if cyl.radius - math.hypot(x1 - cyl.x, x3 - cyl.z) >= 0:
-                cylinder_penalty += cfg.cylinder_penalty
-
-    window_penalty = 0.0
-    for wnd in cfg.windows:
-        min_dist = min(math.hypot(st[0] - wnd.x, st[2] - wnd.z) - wnd.radius for st in states)
-        if min_dist > 0:
-            window_penalty += cfg.window_penalty * (min_dist ** 2)
-
     terminal = np.asarray(cfg.terminal_state, dtype=float)
-    terminal_penalty = cfg.terminal_penalty * float(np.linalg.norm(states[cfg.num_intervals] - terminal))
+    terminal_penalty = cfg.terminal_penalty * float(np.linalg.norm(states[-1] - terminal))
 
-    return cfg.dt * cfg.num_intervals + terminal_penalty + cylinder_penalty + window_penalty
+    return (
+        cfg.dt * len(controls)
+        + terminal_penalty
+        + _cylinder_penalty(states, cfg)
+        + _window_penalty(states, cfg)
+    )
 
 
-# ---------------------------------------------------------------------------
-# Numba JIT (используется в имитации отжига и пакетном вычислении функционала)
-# ---------------------------------------------------------------------------
+def _cylinder_penalty(states: np.ndarray, cfg: CostConfig) -> float:
+    penalty = 0.0
+
+    for state in states:
+        x1, x3 = state[0], state[2]
+        for cylinder in cfg.cylinders:
+            if cylinder.radius - math.hypot(x1 - cylinder.x, x3 - cylinder.z) >= 0:
+                penalty += cfg.cylinder_penalty
+
+    return penalty
+
+
+def _window_penalty(states: np.ndarray, cfg: CostConfig) -> float:
+    penalty = 0.0
+
+    for window in cfg.windows:
+        min_distance = min(math.hypot(state[0] - window.x, state[2] - window.z) - window.radius for state in states)
+        if min_distance > 0:
+            penalty += cfg.window_penalty * (min_distance ** 2)
+
+    return penalty
+
 
 @njit(cache=True)
 def model_nb(state, control):

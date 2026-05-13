@@ -31,7 +31,8 @@ func EuclideanDistance(current, target [6]float64) float64 {
 	var distance float64
 
 	for i := 0; i < len(current); i++ {
-		distance += math.Pow(current[i]-target[i], 2)
+		diff := current[i] - target[i]
+		distance += diff * diff
 	}
 
 	return math.Sqrt(distance)
